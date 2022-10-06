@@ -1,0 +1,864 @@
+---
+title: "Item Bank Assessment"
+author: "Brian Syzdek"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 999)
+```
+
+```{r libraries}
+library(pool)
+library(DBI)
+library(ROracle)
+library(odbc)
+library(parallel)
+library(dplyr)
+library(readxl)
+library(lme4)
+library(ggplot2)
+library(simr)
+```
+
+```{r read-in-supplementary-data, echo=FALSE}
+## Helper functions for data munging and plotting
+source("C:/Prov/Research/helper_functions/helper_functions.R")
+source("C:/Prov/Research/helper_functions/ggplot_helper_functions.R")
+## Database login information
+source("C:/Prov/Research/helper_functions/database_private_information_dont_publish_this.R")
+## Read in a one column file with vector of ids to match in database, called with ids$ITEM_TITLE
+ids <- readxl::read_xlsx("exam_ids_to_analyze.xlsx") %>% # Change to be any file
+  rename("ITEM_TITLE" = 1) 
+```
+
+# Introduction
+
+The purpose of this report is to provide information about performance of select test items--to determine if items have performed different on different exams and if items have changed over time ("item drift"). The scores of those items, 0 for incorrect and 1 for correct ("item_correct_numeric"), will be analyzed for average variation across previously given examinations ("BLUEPRINT_EXAM_NAME") and time--at year interval precision ("year").
+
+This data analysis is generalized to allow for input of any vector of item titles and to to run all the following data analysis procedures and then output results, as in this report, automatically. `r colorize("(Give specific selection criteria in following)", "red")` In this particular report, the items are all drawn from the "Item Title" column in the "Starting" sheet in the "GC Starting Bank 2019" file. Data were queried with completion status complete, items marked correct as either "Y" or "N" (upon inspection found to be mostly redundant with completion status complete), and any date.
+
+# Data Input and Exploration
+
+There were a total of `r nrow(ids)` target item titles. As the database is large and the vector of item titles can be large, this data extraction can potentially be extremely slow, to the point of failure. Thus, procedures for speeding up this process were considered. 
+
+Parallelization is a process that assigns different tasks to separate cores of a computer. As it applies here, the vector with target ids to match in the data base is split into groups equal to the number of machine cores. The database query for items matching target titles for each group is then run on each separate core. The grouped datasets are then merged together at completion. In light testing, this method resulted in a 50% reduction in data extraction time compared to non-parallelization corresponding methods, with non-parallelization methods failing with a large number of terms. 
+
+Alternatively, inner join data extraction methods pull data that matches a column in a target table, in this case the target ids. This was found to be the fastest method for extracting data. Using inner join extraction requires privileges to create or edit a temporary table in the database that contains the target ids to join.
+
+```{r id-list}
+###*** Divides list of ids into groups that match number of cores. Used to read data and also to divide data for lmer procedurs. Run this regardless of read data method
+## First divide the target ids into (core - 1) groups with equal numbers of ids. Then put remainder in final core group.
+cores <- detectCores() # get number of cores in machine
+# Number of id terms for query in #core -1
+items_per_core <- floor(nrow(ids) / (cores - 1)) 
+total_to_evenly_split <- items_per_core*(cores-1) # Total, without remainder
+# Produces a named list of lists, named by core/group number. Each list has even number of lists, representing the number of queries, with the remainder tacked on as list
+# Split, splits the number of ids into even groups
+ids_list <- split(ids$ITEM_TITLE[1:total_to_evenly_split], 
+      # Divides into cores-1 groups, in order, e.g. 111222...
+      cut(seq_along(ids$ITEM_TITLE[1:total_to_evenly_split]), 
+          (cores-1), labels = FALSE)
+      ) %>% 
+  #combine this list with remainder number of items into named list
+  c(., 
+    purrr::set_names(
+      list(ids$ITEM_TITLE[(total_to_evenly_split + 1):nrow(ids)]), 
+      cores) # Name
+    )
+```
+
+```{r read-data-from-database, eval=FALSE}
+# Eval = FALSE in development, to avoid long times. Remove for final. In development, call rmarkdown::render("file_name.Rmd") to read dat_list from environment
+###*** Connect with database, query and join multiple tables whose ids match a vector of supplied ids, using parallelization to greatly increase speed- Parallelization method- via microbenchmark, 50% time of as without
+
+## Set-up cores
+cluster <- makePSOCKcluster(cores)
+## Objects to be passed to cores- id_list, database info
+clusterExport(cluster, varlist = list("ids_list", "db_drv_prv", "host_prv", "sid_prv", "username_prv", "password_prv", "%>%"))
+# From library parallel, applies each set of id_list search ids
+parLapply(cluster, 1:cores, function(i){
+  library(ROracle)
+  ### Connect to db
+## Private database information appended _prv is included in sourced file
+drv <- dbDriver(db_drv_prv)
+host <- host_prv
+port <- 1521
+sid <- sid_prv
+connect.string <- paste(
+  "(DESCRIPTION=",
+  "(ADDRESS=(PROTOCOL=tcp)(HOST=", host, ")(PORT=", port, "))",
+  "(CONNECT_DATA=(SID=", sid, ")))", sep = "")
+## Use username/password authentication.
+con <- dbConnect(drv, username = username_prv, password = password_prv,
+                 dbname = connect.string)
+
+  ###*** Query data by item_title or name; returns list of tibbles with data
+  purrr::map(
+    .x = ids_list[[i]],
+    .f = ~{
+      dbGetQuery(con, sprintf("
+           SELECT ts.test_session_id , ts.test_date_time,
+                  si.correct_flag,
+                  it.item_title,
+                  exbl.NAME blueprint_exam_name
+    
+            FROM examappl_prodgnv.exam_test_session ts
+              LEFT OUTER JOIN examappl_prodgnv.exam_session_item si
+                  ON ts.test_session_id = si.exam_session_id
+              LEFT OUTER JOIN examappl_prodgnv.exam_item it
+                ON  si.item_id = it.item_id AND 
+                it.actual_end_date_time >  TO_DATE('3000-01-01', 'YYYY-MM-DD')
+              JOIN examappl_prodgnv.exam_exam exbl
+                  ON exbl.exam_id1 = ts.exam_id1
+              
+            WHERE it.item_title IN '%s' and
+              ts.session_status_code = 'CO'
+           ", .x)) # Passes vector of item_titles to WHERE IN statement
+    } %>% 
+      dplyr::as_tibble()
+  )
+}) -> dat_list # List of lists with each being tibble with item_title info
+```
+
+```{r combine-lists-to-master-df, eval = FALSE}
+###*** Only run if above is run, querying database
+###*** Collapse all lists to one tibble, perform planned data manipulation- remove invalid item_correct responses and mutate to numeric, manipulate date fields into R dates
+## Data with planned data manipulation, before inspection. Used to show inspection below
+original_dat <- dat_list %>% 
+  bind_rows %>%
+  filter(CORRECT_FLAG %in% c("N", "Y") &
+           !is.na(TEST_DATE_TIME) &
+           !is.na(BLUEPRINT_EXAM_NAME)) %>% 
+  mutate(item_correct_numeric = ifelse(CORRECT_FLAG == "Y", 1, 0),
+               date = as.Date(TEST_DATE_TIME),
+               year = lubridate::year(date)) 
+
+# Following is additional data cleaning after reviewing output. Use full_dat throughout analysis. Assigned here to complete all data cleaning here.
+full_dat <- original_dat %>% 
+  filter(!duplicated(.) & 
+           year >= 2017)
+
+```
+
+```{r read-data-from-wd}
+###*** Read data from working directory. If querying database, then eval = FALSE this section
+###* Read data, then perform planned data manipulation- remove invalid item_correct responses and mutate to numeric, manipulate date fields into R dates
+## Data with planned data manipulation, before inspection. Used to show inspection below
+original_dat <- data.table::fread(file = "prov_item_exam_date_db.csv") %>% 
+  inner_join(., ids, by = "ITEM_TITLE") %>%
+  filter(CORRECT_FLAG %in% c("N", "Y") &
+           !is.na(TEST_DATE_TIME) &
+           !is.na(BLUEPRINT_EXAM_NAME)) %>% 
+  mutate(item_correct_numeric = ifelse(CORRECT_FLAG == "Y", 1, 0),
+               date = as.Date(TEST_DATE_TIME),
+               year = lubridate::year(date))
+
+# Following is additional data cleaning after reviewing output. Use full_dat throughout analysis. Assigned here to complete all data cleaning here.
+full_dat <- original_dat %>% 
+  filter(!duplicated(.) & 
+           year >= 2017) %>% 
+  mutate(BLUEPRINT_EXAM_NAME = forcats::as_factor(BLUEPRINT_EXAM_NAME),
+         TEST_SESSION_ID = forcats::as_factor(TEST_SESSION_ID)) %>% 
+  group_by(BLUEPRINT_EXAM_NAME) %>% 
+  filter(n_distinct(TEST_SESSION_ID) > 1000) %>% 
+  ungroup
+
+```
+
+An overview of the raw data:
+
+```{r data-overview}
+# Data head. Use original data to show original count
+original_dat %>% 
+  filter(!duplicated(.)) %>% 
+  {. -> tmp
+  head(tmp) %>% 
+  table_print(caption = table_counter_func(paste("First 6 records of", nrow(tmp))))
+  }
+```
+
+## Data Validation/Cleaning
+
+Data were examined and cleaned with the following procedures.
+
+### Duplicate Records
+
+Data were examined for duplication across all columns. The following number of duplicates were found and were removed from the data set.
+
+```{r duplicate-records}
+###*** Identify any duplicates
+original_dat %>% 
+  filter(duplicated(.)) %>% 
+  dplyr::summarise("Number of Duplicates" = nrow(.)) %>% 
+  table_print(caption = table_counter_func("Duplicates across all fields"))
+```
+
+### Items without valid responses
+
+Items with invalid responses for being marked correct ("CORRECT_FLAG") or those with no response for exam name or test date were considered invalid and were filtered from the data. This is confirmed:
+
+```{r valid-responses}
+full_dat %>% 
+  filter(! CORRECT_FLAG %in% c("N", "Y"), 
+         is.na(BLUEPRINT_EXAM_NAME),
+         is.na(TEST_DATE_TIME)) %>% 
+  group_by(BLUEPRINT_EXAM_NAME) %>% 
+  dplyr::summarise("Number of Invalid Items" = n()) %>% 
+  table_print(caption = table_counter_func("Invalid Items"))
+```
+
+## Summary
+
+Items were first overall summarized to obtain a rough, general understanding. Variable 'Avg Item Correct' was constructed and represents the total number of items correct ("item_correct_numeric") divided by the total number of items within a group. This variable is used throughout as a way to measure item performance with unbalanced groups. Groups are the ways items are aggregated, such as within an exam or year. 
+
+### Item Summary by Year
+
+```{r years-summary}
+# Summary of variables of interest, use original_dat to show all years, before filter
+original_dat %>% 
+  filter(!duplicated(.)) %>% 
+  # To group_by
+  mutate(year = forcats::as_factor(year)) %>% 
+  group_by(year) %>% 
+  # Counts of each
+  summarize(
+    number_of_items_administered = n(),
+    number_of_exams = n_distinct(TEST_SESSION_ID),
+    number_of_forms = n_distinct(BLUEPRINT_EXAM_NAME),
+    avg_item_correct = round(sum(item_correct_numeric)/number_of_items_administered, 2)
+  ) %>% 
+  table_print(caption = table_counter_func("Items and Exams by Year"))
+```
+
+`r colorize("(Interpret)", "red")` Looking at the overall Avg Item Correct across years, it seems that there is a slight downward trend. However, not too much stock should be put in overall scores as there may be differences in the items administered, and corresponding item difficulties, over time. To focus on more recent data and for more efficient analysis, only data within the last five years, those with years >= 2017 were included. 
+
+### Item Summary by Exam
+
+A summary of exams follows, with the number of administrations and the number of targeted items contained with each exam, along with the average correct of those items.
+
+```{r exam-overall-means}
+###*** Average Item correct by item
+original_dat %>% 
+  filter(!duplicated(.) & 
+           year >= 2017) %>% 
+  group_by(BLUEPRINT_EXAM_NAME) %>% 
+  dplyr::summarise(number_of_items_administered = n(),
+                   number_of_unique_items = n_distinct(ITEM_TITLE),
+                   avg_item_correct = sum(item_correct_numeric)/number_of_items_administered) %>% 
+  arrange(desc(avg_item_correct)) %>% 
+  mutate(across(where(is.numeric), round, 2)) %>% 
+  table_print(caption = table_counter_func("Exam Difficulties")) %>% 
+ scroll_box(width = "500px", height = "500px")
+```
+
+The average correct of items included in this analysis differed across exams. Some exams had a small number of observations (items administered), making comparisons involving these exams inefficient and potentially unrepresentative, or biased, in further analyses. A minimum of 1000 items was determined to be necessary for an exam to be included in analyses after this summary section. After removing those exams, the summary of exams is:
+
+```{r exam-overall-means-removed-low-count-exams}
+###*** Average Item correct by item, low administrations filtered
+full_dat %>% 
+  group_by(BLUEPRINT_EXAM_NAME) %>%  
+  dplyr::summarise(number_of_items_administered = n(),
+                   number_of_unique_items = n_distinct(ITEM_TITLE),
+                   avg_item_correct = sum(item_correct_numeric)/number_of_items_administered) %>% 
+  arrange(desc(avg_item_correct)) %>% 
+  mutate(across(where(is.numeric), round, 2)) %>% 
+  table_print(caption = table_counter_func("Exams Filtered by Sample Size Difficulties")) 
+```
+
+### Item Summary
+
+Here the items are presented ungrouped, that is, the percentage correct for all administrations of each item, after filtering by year and exam sample size, as described previously.
+
+#### Item Count
+
+```{r item-overall-means}
+###*** Average Item correct by item
+full_dat %>% 
+  group_by(ITEM_TITLE) %>% 
+  dplyr::summarise(number_of_administrations = n(),
+                   avg_item_correct = sum(item_correct_numeric)/number_of_administrations) %>% 
+  arrange(desc(avg_item_correct)) %>% 
+  mutate(across(where(is.numeric), round, 2)) %>% 
+  table_print(caption = table_counter_func("Item Difficulties")) %>% 
+ scroll_box(width = "500px", height = "500px")
+
+```
+
+`r colorize("(Inspect and confirm following)", "red")`
+It appears that each item was administered sufficiently for analysis. Inspection of a random selection of Avg Item Correct values find they correspond well to p-values included in the database.
+
+After filtering and data cleaning, there were a total of `r nrow(full_dat)` records of item-level data with item titles matching the target titles. There were `r n_distinct(full_dat$BLUEPRINT_EXAM_NAME)` different examinations and `r n_distinct(full_dat$TEST_SESSION_ID)` separate administrations to individual examinees total.
+
+# Item Differences Across Exams and Time
+
+Above summaries of items correct within years and exams do not take into account differences in the item types administered. The average correct responses for specific items within exams and years were examined for differences across exams and time. This was done by analyzing item interactions with test and time. If significant effects were obtained, that would show that items varied across those variables. 
+
+## Test for Differences
+
+Before examining for differences of individual items across exams and over time, we should first determine if there are significant overall differences between all items interacting with exams and years. This will account for the numerous analyses of individual items, within the context of the larger dataset. 
+
+We can do this by constructing mixed-effects models with item_correct_numeric (correct = 1, incorrect = 0) as the outcome variable and ITEM_TITLE as predictor. Year and exam name (BLUEPRINT_EXAM_NAME) are interaction effects with ITEM_TITLE, included in separate models for each interaction. A reduced model with the interaction term included in the full model removed is then constructed. The full and reduced models are then compared with likelihood ratio test to assess for significance of the interaction effect, using a p-value of .05 and examining the strength of the effect, which follows a chi-squared distribution. TEST_SESSION_ID is a random effect to be controlled for and included in each model, representing the variation among test takers. It is nested within exam name, when that is not a main effect (in the model with year as a predictor interacting with items). Because the outcome variable, item_correct_numeric is binomial, logistic regression is used. 
+
+`r colorize("(Review suitability of mixed-methods models below to determine best approach.)", "red")`
+
+The above is the ideal approach. In preliminary analyses, using the entire dataset, with all item and exam and year combinations, resulted in models that failed to converge due to being too large and complicated. To manage this, subsets of the full data were obtained and then used to construct models in order to have a more manageable sample size. The sample size and number of repetitions necessary to achieve 80% power level were estimated with likelihood ratio test simulations.
+
+The dataset was repeatedly sampled, in differing sample sizes and repetitions, described separately below, the models were constructed and compared, and if the full model with interaction term was significant, the significant individual item and exam or year interaction effects were identified. The significance level was Bonferonni corrected to account for the multiple comparisons. The frequency of significant interactions was observed, as items found more frequently significant in interaction with exam and year have a greater likelihood of truly varying across those factors.
+
+```{r sample-data-for-modeling, eval = FALSE}
+###*** Divide full dataset into a list, grouped by ids, as grouped by cores above. 
+###* Not used here, as sampling used instead
+purrr::map(
+  .x = 1:cores,
+  .f = ~{
+    tibble(ITEM_TITLE = ids_list[[.x]]) %>% 
+  inner_join(., full_dat, by = "ITEM_TITLE") 
+  }
+) %>% purrr::set_names(., nm = cores)-> dat_list
+
+```
+
+```{r mixed-effects-models-exam}
+###*** Mixed-methods models to test items' interaction with exams and time. Models start with full, ideal construction and then are adjusted as needed to accommodate data limitations
+
+###*** Mixed-methods models with BLUEPRINT_EXAM_NAME crossed with ITEM_TITLE, predicting item_correct_numeric, binomial distribution in full; remove interaction in reduced and lrtest
+###* Note use of options that reduce run time. May remove for less data/effects
+
+## ITEM_TITLE varying with Exam- function, apply to sampled data
+item_exam_interaction_func <- function(dat){
+  ## Remove low combinations of items and exams
+      dat %>% 
+      group_by(ITEM_TITLE, BLUEPRINT_EXAM_NAME) %>% 
+      count %>% ungroup %>% 
+      filter((duplicated(ITEM_TITLE) | duplicated(ITEM_TITLE, fromLast = TRUE)) & n > 100) %>% 
+      dplyr::select(ITEM_TITLE, BLUEPRINT_EXAM_NAME) %>% 
+      inner_join(., dat, by = c("ITEM_TITLE", "BLUEPRINT_EXAM_NAME")) -> dat
+  # Shouldn't be necessary after above filter, but this just checks that any of following factors don't have only one level
+    if(length(unique(dat$BLUEPRINT_EXAM_NAME)) > 1 & 
+       length(unique(dat$TEST_SESSION_ID)) > 1 &
+       length(unique(dat$ITEM_TITLE)) > 1){
+# Full model
+  # model_exam_item_interaction <- lme4::glmer(item_correct_numeric ~ ITEM_TITLE * BLUEPRINT_EXAM_NAME + (1|TEST_SESSION_ID) + (1|year), data = dat, family = "binomial", nAGQ=0, control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=1e5)))
+  
+  # Full model interaction only. If data does not have too many factors, change to ITEM_TITLE*BLUEPRINT_EXAM_NAME to get interaction and main effects, then change reduced model below
+  model_exam_item_interaction <- lme4::glmer(item_correct_numeric ~ ITEM_TITLE : BLUEPRINT_EXAM_NAME + (1|TEST_SESSION_ID) + (1|year), data = dat, family = "binomial", nAGQ=0, control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=1e5)))
+  
+  # Reduced model
+  # model_exam_item_no_interaction <- lme4::glmer(item_correct_numeric ~ ITEM_TITLE + BLUEPRINT_EXAM_NAME + (1|TEST_SESSION_ID) + (1|year), data = dat, family = "binomial", nAGQ=0, control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=1e5)))
+  
+  # Reduced model with only intercept to test for only interaction. If data does not have too many factors, change to ITEM_TITLE + BLUEPRINT_EXAM_NAME to get interaction and main effects, then change full model above
+  model_exam_item_no_interaction <- lme4::glmer(item_correct_numeric ~ BLUEPRINT_EXAM_NAME + (1|TEST_SESSION_ID) + (1|year), 
+                                                data = na.omit(dat[ , all.vars(formula(model_exam_item_interaction))]), # Only uses data that was used in full model, so can compare via likelihood test
+                                                family = "binomial", 
+                                                # Following options reduce time, but could make less accurate
+                                                nAGQ=0, control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=1e5)))
+  
+###*** List of significance and coefficients
+  list(
+    significance =
+  # Test for significance of interaction
+  lmtest::lrtest(model_exam_item_interaction, model_exam_item_no_interaction) %>% 
+      dplyr::select(
+        pr = `Pr(>Chisq)`,
+        Chisq
+      ) %>% 
+      slice(2) %>% tibble
+      ,
+  # Extract all coefficieints and their stats
+      coef_tibble = as.data.frame(coef(summary(model_exam_item_interaction))) %>% 
+        tibble::rownames_to_column(., var = "item")
+    )
+  # If not significant return NA's for this run
+  } else{
+      list(
+        significance =
+        tibble(
+          pr = as.numeric(NA),
+          Chisq = as.numeric(NA)
+        )
+        ,
+      coef_tibble = tibble(item = NA, Estimate = NA, `Std. Error` = NA, `z value` = NA, `Pr(>|z|)` = NA)
+    )
+  }
+}
+
+###*** Instead of glmer in lme4, may consider using glmmTMB::glmmTMB, which is supposed to be faster, though I didn't see a difference
+###*model_year_item_interaction <- glmmTMB::glmmTMB(item_correct_numeric ~ ITEM_TITLE*year + (1|TEST_SESSION_ID/BLUEPRINT_EXAM_NAME), data = full_dat, family = "binomial", control = glmmTMB::glmmTMBControl(profile = TRUE, collect = TRUE, eigval_check = FALSE))
+```
+
+```{r use-all-data-exam-model, eval = FALSE}
+## If data is not too large, use all of it
+item_exam_interaction_func(full_dat) %>% 
+  rowwise() %>% 
+  mutate(
+    pr = as.character(p_value_only_func_significance(pr)),
+    Chisq = round(Chisq, 2)
+  ) %>%
+  ungroup() %>% 
+  table_print(caption = table_counter_func("Mixed-Effects Exam and Item Interaction")) %>% footnote_func(.,  footnote_caption = p_value_asterisk_significance_note)
+```
+
+```{r use-split-data-exam-model, eval = FALSE}
+# This method applies each set of items that were separated when reading in data. If using sample method, don't run this
+purrr::map(
+  .x = dat_list, 
+  .f = ~{
+    item_exam_interaction_func(.x) %>% 
+      bind_rows
+  }) %>% 
+  bind_rows %>% 
+  filter((grepl(":", item) & `Pr(>|z|)` < (.05/nrow(ids))) | 
+            (!is.na(Chisq) & pr < .05)
+         ) %>% 
+  rowwise() %>% 
+  mutate(
+    pr = as.character(p_value_only_func_significance(pr)),
+    `Pr(>|z|)` = as.character(p_value_only_func_significance(`Pr(>|z|)`)),
+    across(where(is.numeric), round, 2),
+    item = gsub("ITEM_TITLE|:.*$", "", item)
+  ) %>%
+  ungroup() %>% 
+  table_print(caption = table_counter_func("Mixed-Effects Exam and Item Interaction")) %>% 
+  footnote_func(.,  footnote_caption = p_value_asterisk_significance_note)
+
+```
+
+```{r mixed-effects-model-year}
+## ITEM_TITLE varying with year
+item_year_interaction_func <- function(dat){
+  # Check that there are unique values for year, otherwise drop
+  if(length(unique(dat$year)) > 1 & length(unique(dat$TEST_SESSION_ID)) > 1){
+    # Full model
+    model_year_item_interaction <- lme4::glmer(item_correct_numeric ~ ITEM_TITLE * year + (1|TEST_SESSION_ID/BLUEPRINT_EXAM_NAME), data = dat, family = "binomial", nAGQ=0, control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=1e5)))
+    
+    # Reduced model
+    model_year_item_no_interaction <- lme4::glmer(item_correct_numeric ~ ITEM_TITLE + year + (1|TEST_SESSION_ID/BLUEPRINT_EXAM_NAME), data = dat, family = "binomial", nAGQ=0, control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=1e5)))
+    
+    ###*** List of significance and coefficients
+    list(
+      significance =
+        
+        # Test for significance of interaction
+        lmtest::lrtest(model_year_item_interaction, model_year_item_no_interaction) %>% 
+        dplyr::select(
+          pr = `Pr(>Chisq)`,
+          Chisq
+        ) %>% 
+        slice(2) %>% tibble
+      ,
+      # Get significant coefficients
+      coef_tibble = as.data.frame(coef(summary(model_year_item_interaction))) %>% 
+        tibble::rownames_to_column(., var = "item")
+    )
+  } else{
+    # Return NA if not significant
+    list(
+      significance = 
+        tibble(
+          pr = as.numeric(NA),
+          Chisq = as.numeric(NA)
+        ),
+      coef_tibble = tibble(item = NA, Estimate = NA, `Std. Error` = NA, `z value` = NA, `Pr(>|z|)` = NA)
+    )
+  }
+}
+```
+
+```{r use-all-data-year-model, eval = FALSE}
+## If data is not too large, use all of it
+item_year_interaction_func(full_dat) %>% 
+  rowwise() %>% 
+  mutate(
+    pr = as.character(p_value_only_func_significance(pr)),
+    Chisq = round(Chisq, 2)
+  ) %>%
+  ungroup() %>% 
+  tibble::rownames_to_column(., var = "Item Batch") %>% 
+  table_print(caption = table_counter_func("Mixed-Effects Year and Item Interaction")) %>% footnote_func(.,  footnote_caption = p_value_asterisk_significance_note)
+```
+
+## Item and Exam Interaction
+
+There were a large number of items and exams in the dataset, which resulted in a large number of contrasts. There were some exam and item interactions with low counts, potentially leading to problems with model convergence and spurious results from low sample size. Data from exams with less than 100 item administrations were removed. Also, data from items that were only administered on one exam were filtered as contrasts between factors with only one level are not possible.
+
+Data with the following ITEM_TITLE were removed based on these criteria:
+
+```{r filtered-items-low-sample-one-level}
+full_dat %>% 
+    group_by(ITEM_TITLE, BLUEPRINT_EXAM_NAME) %>% 
+    count %>% ungroup %>% 
+    filter(!(duplicated(ITEM_TITLE) | duplicated(ITEM_TITLE, fromLast = TRUE)) & n > 100) %>% 
+  table_print(caption = table_counter_func("Items Removed for Low Count and Only Being on One Exam")) %>% 
+ scroll_box(width = "500px", height = "500px")
+
+```
+
+`r colorize("(Edit below based on data and adjust contrasts in model)", "red")`
+Also, because of the large number of items and exams, rank-deficiencies were obtained in full models due to their being too many interactions. Thus, the full model was modified to only include an interaction term (rather than interaction and main effect terms) and the reduced model was modified to only contain a main effect for BLUEPRINT_EXAM_NAME to test for the removal of the interaction. The interpretation of this procedure is that it is testing if item have different scores across exams, above and beyond the differences between exams without considering item differences. Items that were significant were identified.
+
+```{r sample-size-simulation, eval = FALSE}
+###*** Sample size calculations. Simulation to estimate power from given sample size. Run separately from console.
+###* Use simr to simulate model to get power size for Exam test
+exam_sample_reps <- 15
+exam_sample_size <- 10000
+slice_sample(full_dat, n = exam_sample_size) %>% 
+      group_by(ITEM_TITLE, BLUEPRINT_EXAM_NAME) %>% 
+      count %>% ungroup %>% 
+      filter((duplicated(ITEM_TITLE) | duplicated(ITEM_TITLE, fromLast = TRUE)) & n > 100) %>% 
+      dplyr::select(ITEM_TITLE, BLUEPRINT_EXAM_NAME) %>% 
+      inner_join(., full_dat, by = c("ITEM_TITLE", "BLUEPRINT_EXAM_NAME")) -> sim_dat_exam
+sim_mod_exam <- lme4::glmer(item_correct_numeric ~ ITEM_TITLE : BLUEPRINT_EXAM_NAME + (1|TEST_SESSION_ID) + (1|year), data = sim_dat_exam, family = "binomial", nAGQ=0, control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=1e5)))
+
+# This shows 80% power with above sample size and number of simulations
+powerSim(sim_mod_exam, fcompare(~ BLUEPRINT_EXAM_NAME, method = "lr"), nsim = exam_sample_reps)
+
+###* Use simr to simulate model to get power size for Year test
+###* 
+year_sample_reps <- 10
+year_sample_size <- 100000
+
+slice_sample(full_dat, n = year_sample_size) -> sim_dat_year
+
+sim_mod_year <- lme4::glmer(item_correct_numeric ~ ITEM_TITLE * year + (1|TEST_SESSION_ID/BLUEPRINT_EXAM_NAME), data = sim_dat_year, family = "binomial", nAGQ=0, control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=1e5)))
+
+# This shows 80% power with above sample size and number of simulations
+powerSim(sim_mod_year, fcompare(~ ITEM_TITLE + year, method = "lr"), nsim = year_sample_reps)
+
+    
+```
+
+```{r apply-split-data-exam-model, results='asis'}
+# If model can't handle all data, use this
+###*** Applying functions- based on model response, can use different data, such as dat_list that contains all the data segmented by groups of items, or can use sampling that will sample the whole data
+
+# if segmented, delete here to purrr::map
+exam_sample_reps <- 15
+exam_sample_size <- 10000
+infer::rep_slice_sample(full_dat, n = exam_sample_size, reps = exam_sample_reps) %>% group_by(replicate) %>% tidyr::nest() %>% 
+purrr::map(
+  .x = .$data, # if want sampling
+  #.x = dat_list, # if want all data 
+  .f = ~{
+    tmp <- item_exam_interaction_func(.x)
+    # If significant
+  if(!is.na(tmp$significance$pr)){
+    # Bonferonni correction
+      tmp$coef_tibble <- if(tmp$significance$pr < (.05/exam_sample_reps)){
+        # Output NA's if not significant
+      tmp$coef_tibble
+    } else{
+      tibble(item = NA, Estimate = NA, `Std. Error` = NA, `z value` = NA, `Pr(>|z|)` = NA)
+    }
+  } else{
+      tibble(item = NA, Estimate = NA, `Std. Error` = NA, `z value` = NA, `Pr(>|z|)` = NA)
+    }
+     tmp %>% bind_rows
+  }) %>% 
+  # Retain item names, significance, bonferonni correction
+  bind_rows %>% 
+  filter((grepl(":", item) & `Pr(>|z|)` < (.05/nrow(ids))) # | 
+            # (!is.na(Chisq) & pr < .05)
+         ) %>% 
+  {. -> tmp_dat
+    if(nrow(tmp_dat) > 0){
+      tmp_dat %>% 
+  rowwise() %>% 
+        # Extract item information
+  mutate(
+     pr = as.character(p_value_only_func_significance(pr)),
+    `Pr(>|z|)` = as.character(p_value_only_func_significance(`Pr(>|z|)`)),
+    across(where(is.numeric), round, 2),
+    item = gsub("ITEM_TITLE|:.*$", "", item)
+  ) %>%
+  ungroup() %>% 
+  {. -> tmp
+    print(
+      # Table of how many times items significant
+      tmp %>% 
+        group_by(item) %>% 
+        count(name = "Number of Times Significant") %>% 
+        filter(!is.na(item)) %>% 
+        arrange(desc(`Number of Times Significant`)) %>% 
+        table_print(caption = table_counter_func("Number of Times Items with Significant Interaction with Exams"))
+    ) -> suppress_print_msg
+    ###*** Uncomment this if want full table of all runs, if not just summary
+    # print( 
+    # table_print(tmp, caption = table_counter_func("Mixed-Effects Exam and Item Interaction")) %>% footnote_func(.,  footnote_caption = p_value_asterisk_significance_note))
+    
+    # For items identified as significant, below gets post-hoc comparison information
+    full_dat %>% 
+  inner_join(., tmp, by = c("ITEM_TITLE" = "item")) %>% 
+  group_by(ITEM_TITLE) %>% 
+  tidyr::nest() %>% 
+  mutate(exam_averages = purrr::map(.,
+                             .x = data,
+                             .f = ~{
+                               .x %>% 
+                                 group_by(BLUEPRINT_EXAM_NAME) %>% 
+                                  dplyr::summarise(
+                                    avg_item_correct = round(sum(item_correct_numeric)/n(), 2), 
+                                    sem = round(psych::describe(item_correct_numeric)$se, 2)
+                                    ) %>% 
+                                 arrange(desc(avg_item_correct)) %>% 
+                                 ungroup
+                             }) #,
+    #      post_hoc = purrr::map(.,
+    #                            .x = data,
+    #                            .f = ~{
+    # if(length(unique(.x$BLUEPRINT_EXAM_NAME)) > 1){                             
+    # glmer(item_correct_numeric ~ BLUEPRINT_EXAM_NAME + (1|TEST_SESSION_ID), data = .x, family = "binomial") %>% postHoc::posthoc(.)
+    # } else{
+    #   NA
+    # }
+    #                            })
+    ) %>% 
+    # Below outputs Items, post-hoc tables and plots side-by-side
+  slider::slide(
+    .x = .,
+    .f = ~{
+     if(nrow(.x) == 0){
+        cat("\n\n ##### No significant year and item interaction \n\n")
+      } else{
+      cat("\n\n####", .x$ITEM_TITLE, "\n\n")
+      cat(
+        # 2 column rows
+      "<div class = 'row h-100'>",
+        "<div class = 'col-sm-6'>")
+          print(table_print(.x$exam_averages[[1]], caption = paste(.x$ITEM_TITLE, "Average Scores by Exam"))
+              ) -> suppress_print_msg
+      cat(
+        "</div>",
+        "<div class = 'col-sm-6' style = 'margin-top: 150px'>"
+          )
+          print(
+            # plot(.x$post_hoc[[1]])
+###*** GGPLOT of exam avgs
+            .x$exam_averages[[1]] %>% 
+            # Puts BLUEPRINT_EXAM_NAME as factor in order (but flipped as coord_flip is used)
+              mutate(
+        BLUEPRINT_EXAM_NAME = forcats::fct_rev(
+            forcats::fct_inorder(as.character(BLUEPRINT_EXAM_NAME)))) %>% 
+            ggplot(., aes(x = BLUEPRINT_EXAM_NAME, y = avg_item_correct)) +
+              geom_col(
+                          position = position_dodge2(preserve = "single"),
+                          alpha = 0.2,
+                          color = "black"
+                        ) +
+          # Errorbars of sem
+              geom_errorbar(aes(ymin = avg_item_correct - sem, ymax = avg_item_correct + sem), position = position_dodge(width=0.9), color = "red", width = 0.5) +
+                labs(x = "Exam", y = "Average Item Correct") +
+                ggtitle(paste(.x$ITEM_TITLE, "Average Scores by Exam")) +
+              coord_flip()
+            )
+      cat(
+        "</div>",
+      "</div>",
+      "<hr>"
+      )
+      }
+    }
+  )
+  }
+  }} -> suppress_print_msg
+```
+
+Data were sampled into groups of `r exam_sample_size` and the modeling analysis was repeated `r exam_sample_reps` times. 
+
+`r colorize("(Interpret)", "red")`
+
+As can be seen, there were several items that repeatedly had significant interaction effects with exams. The post-hoc analysis of these items show the differences in scores. Exam scores where error bars don't overlap represent significantly different exam scores. The biggest differences seemed to be how items performed on Business Procedures (harder) compared to Business and Law (easier).
+
+## Item and Year Interaction
+
+Because year was set as a numeric variable, there were not the same problems with rand deficiencies, as with exams. Therefore, the full model contained an interaction term and separate fixed effects for year and items. This is a more powerful model, and takes longer, so there were fewer repeated samples. As a result, items that were identified as few as once as significant were output.
+
+```{r apply-split-data-year-model, results='asis'}
+# If model can't handle all data, use this
+###*** Applying functions- based on model response, can use different data, such as dat_list that contains
+year_sample_reps <- 10
+year_sample_size <- 10000
+infer::rep_slice_sample(full_dat, n = year_sample_size, reps = year_sample_reps) %>% group_by(replicate) %>% tidyr::nest() %>% 
+purrr::map(
+  .x = .$data,
+  #.x = dat_list, 
+  .f = ~{
+    tmp <- item_year_interaction_func(.x)
+    if(!is.na(tmp$significance$pr)){
+         tmp$coef_tibble <- if(tmp$significance$pr < (.05/year_sample_reps)){
+        tmp$coef_tibble
+      } else{
+        tibble(item = NA, Estimate = NA, `Std. Error` = NA, `z value` = NA, `Pr(>|z|)` = NA)
+      }
+    } else{
+    tibble(item = NA, Estimate = NA, `Std. Error` = NA, `z value` = NA, `Pr(>|z|)` = NA)
+  }
+     tmp %>% bind_rows
+  }) %>% 
+  bind_rows %>% 
+  filter((grepl(":", item) & `Pr(>|z|)` < (.05/year_sample_reps)) #| 
+            # (!is.na(Chisq) & pr < .05)
+         ) %>% 
+  {. -> tmp_dat
+    if(nrow(tmp_dat) > 0){
+      tmp_dat %>% 
+  rowwise() %>% 
+  mutate(
+     pr = as.character(p_value_only_func_significance(pr)),
+    `Pr(>|z|)` = as.character(p_value_only_func_significance(`Pr(>|z|)`)),
+    across(where(is.numeric), round, 2),
+    item = gsub("ITEM_TITLE|:.*$", "", item)
+  ) %>%
+  ungroup() %>% 
+  {. -> tmp
+    print(
+      tmp %>% 
+        group_by(item) %>% 
+        count(name = "Number of Times Significant") %>% 
+        filter(!is.na(item)) %>% 
+        arrange(desc(`Number of Times Significant`)) %>% 
+        table_print(caption = table_counter_func("Number of Times Items had Significant Interaction with Year"))
+    ) -> suppress_print_msg
+    
+    print(
+      tmp %>% dplyr::select(-pr, Chisq) %>% 
+    table_print(., caption = table_counter_func("Significant Year and Item Interaction")) %>% footnote_func(.,  footnote_caption = p_value_asterisk_significance_note))
+    
+    print(full_dat %>% 
+  inner_join(., tmp, by = c("ITEM_TITLE" = "item")) %>% 
+  group_by(ITEM_TITLE) %>% 
+  tidyr::nest() %>% 
+  mutate(exam_averages = purrr::map(.,
+                             .x = data,
+                             .f = ~{
+                               .x %>% 
+                                 group_by(year) %>% 
+                                  dplyr::summarise(avg_item_correct = round(sum(item_correct_numeric)/n(), 2),
+                                                   sem = round(psych::describe(item_correct_numeric)$se, 2)
+                                                   )
+                             })
+    ) %>% 
+  slider::slide(
+    .x = .,
+    .f = ~{
+      if(nrow(.x) == 0){
+        cat("\n\n ##### No significant year and item interaction \n\n")
+      } else{
+      cat("\n\n####", .x$ITEM_TITLE, "\n\n")
+      cat(
+      "<div class = 'row h-100'>",
+        "<div class = 'col-sm-6'>")
+          print(table_print(.x$exam_averages[[1]], caption = paste(.x$ITEM_TITLE, "Average Scores by Year"))) -> suppress_print_msg
+      cat(
+        "</div>",
+        "<div class = 'col-sm-6' style = 'margin-top: 150px'>"
+        )
+          print(
+            ggplot(.x$exam_averages[[1]], aes(x = year, y = avg_item_correct)) +
+              geom_line() +
+              geom_errorbar(aes(ymin = avg_item_correct - sem, ymax = avg_item_correct + sem), position = position_dodge(width=0.9)) +
+                labs(x = "Year", y = "Average Item Correct") +
+                ggtitle(paste(.x$ITEM_TITLE, "Average Scores by Year"))
+        )
+      cat(
+        "</div>",
+      "</div>",
+      "<hr>"
+      )
+      }
+    }
+  ) -> suppress_print_msg
+  ) -> suppress_print_msg}
+  }}-> suppress_print_msg
+```
+
+Data were sampled into groups of `r year_sample_size` and the modeling analysis was repeated `r year_sample_reps` times. 
+
+`r colorize("(Interpret)", "red")`
+
+As can be seen, there were several items that were identified as having a significant interaction with year. The post-hoc analysis of these items show change in item difficulty over time. No non-linear effects were considered. Overall, there was some year-to-year change, but the overall change in difficulty was small. There didn't seem to be any monotonic large changes, such as would indicate a compromised item or a change in item content validity.
+
+```{r describe-data, eval=FALSE}
+
+###*** This could be used to evaluate each item, by item
+full_dat %>% 
+  group_by(ITEM_TITLE) %>% 
+  tidyr::nest() %>% 
+  mutate(
+    mod_full = purrr::map(.,
+      .x = data,
+      .f = ~{
+        .x %>% 
+      group_by(BLUEPRINT_EXAM_NAME) %>% 
+      count %>% ungroup %>% 
+      filter(n > 100) %>% 
+      dplyr::select(BLUEPRINT_EXAM_NAME) %>% 
+      inner_join(., .x, by = "BLUEPRINT_EXAM_NAME") -> dat
+    if(length(unique(dat$BLUEPRINT_EXAM_NAME)) > 1 & 
+       length(unique(dat$TEST_SESSION_ID)) > 1){
+        glm(item_correct_numeric ~ BLUEPRINT_EXAM_NAME, data = dat, family = "binomial")
+    } else {
+          NA
+        }
+      }
+    ),
+    mod_reduced = purrr::map(.,
+      .x = data,
+      .f = ~{
+        .x %>% 
+      group_by(BLUEPRINT_EXAM_NAME) %>% 
+      count %>% ungroup %>% 
+      filter(n > 100) %>% 
+      dplyr::select(BLUEPRINT_EXAM_NAME) %>% 
+      inner_join(., .x, by = "BLUEPRINT_EXAM_NAME") -> dat
+    if(length(unique(dat$BLUEPRINT_EXAM_NAME)) > 1 & 
+       length(unique(dat$TEST_SESSION_ID)) > 1){
+        glm(item_correct_numeric ~ 1, data = dat, family = "binomial")
+    } else{
+          NA
+        }
+      }
+    ),
+    if(!is.na(mod_full)){
+      lmtest::lrtest(mod_full[[1]], mod_reduced[[1]]) %>%
+        dplyr::select(
+          pr = `Pr(>Chisq)`,
+          Chisq
+        ) %>%
+        slice(2) %>% tibble
+      } else{
+        NA
+      },
+    coef_tibble = if(!is.na(mod_full)){
+      as.data.frame(coef(summary(mod_full[[1]]))) %>%
+        tibble::rownames_to_column(., var = "item") %>% list
+    } else{
+      NA
+    }
+  ) %>% 
+  dplyr::select(ITEM_TITLE, pr, Chisq) %>% bind_rows
+
+```
+
+# Discussion
+
+This analysis examined the variation of a select number of items across examinations and time. The code was generalized to allow any vector of items to be input and to run this analysis. As demonstrated in this report, a good use case for this process is to analyze items to be considered for inclusion in an exam based on past performance on previous exams. 
+
+This analysis considered methods for extracting data using several methods to optimize speed. It seems using an inner join approach is the fastest, but requires manipulating the database. Parallelization works best when that is not possible.
+
+As there were a large number of data and analytic methods involved a large number of contrasts, sampling the data and conducting analysis repeatedly was determined to be the best approach to manage these complications. Sample size calculations were performed using simulation of the proposed models for analyzing exam and year interaction with items to determine sample size and number of repetitions necessary to achieve desired power.
+
+Likelihood ratio tests between models with interaction terms and models with interactions removed were conducted to identify if there were significant interactions between items and exams and year. For models with significant interaction effects, specific interaction terms that were significant were extracted. Post-hoc comparisons of these items showed where differences occurred.
+
+`r colorize("(Interpret)", "red")`
+In this analysis items were found to vary across exams. There were two items in particular that varied significantly and consistently across repeated analyses. Items were found to significantly interact with year, though not consistently and in a way that shows meaningful change over time, of the sort that might indicate a consistent change in item performance.
+
+## To-do:
+1. Re-run with different vector of ids
